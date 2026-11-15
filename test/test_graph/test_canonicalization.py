@@ -5,8 +5,18 @@ from typing import TYPE_CHECKING
 import pytest
 
 import rdflib
-from rdflib import RDF, BNode, ConjunctiveGraph, Graph, Literal, Namespace, URIRef
-from rdflib.compare import to_canonical_graph, to_isomorphic
+from rdflib import (
+    RDF,
+    BNode,
+    ConjunctiveGraph,
+    Dataset,
+    Graph,
+    Literal,
+    Namespace,
+    URIRef,
+)
+from rdflib.compare import isomorphic, to_canonical_graph, to_isomorphic
+from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
 from rdflib.namespace import FOAF
 from rdflib.plugins.stores.memory import Memory
 from test.utils import GraphHelper
@@ -535,3 +545,90 @@ class TestConsistency:
         assert cg0_ts.issubset(cg1_ts), (
             "canonical triple set cg0_ts should be a subset of canonical triple set cg1_ts"
         )
+
+
+EX = Namespace("http://example.org/")
+
+
+def dataset_with_quads(*quads) -> Dataset:
+    dataset = Dataset()
+    for s, p, o, graph_name in quads:
+        if graph_name == DATASET_DEFAULT_GRAPH_ID:
+            dataset.add((s, p, o))
+        else:
+            dataset.add((s, p, o, dataset.graph(graph_name)))
+    return dataset
+
+
+class TestDatasetIsomorphic:
+    def test_relabeled_bnodes(self):
+        """Blank node labels, of graph names and triple terms alike, do not
+        affect dataset isomorphism."""
+        lhs = dataset_with_quads(
+            (BNode("x"), EX.p, Literal("o"), BNode("g1")),
+            (EX.d, EX.p, Literal("d"), DATASET_DEFAULT_GRAPH_ID),
+        )
+        rhs = dataset_with_quads(
+            (BNode("y"), EX.p, Literal("o"), BNode("g2")),
+            (EX.d, EX.p, Literal("d"), DATASET_DEFAULT_GRAPH_ID),
+        )
+        assert isomorphic(lhs, rhs)
+
+    def test_default_graph_distinguished_from_named_graph(self):
+        """The same triple in the default graph and in a named graph makes
+        datasets non-isomorphic."""
+        named = dataset_with_quads((EX.s, EX.p, Literal("o"), EX.g))
+        bnode_named = dataset_with_quads((EX.s, EX.p, Literal("o"), BNode("g")))
+        for rhs in (named, bnode_named):
+            default = dataset_with_quads(
+                (EX.s, EX.p, Literal("o"), DATASET_DEFAULT_GRAPH_ID)
+            )
+            assert not isomorphic(default, rhs)
+
+    def test_iri_graph_name_distinguished_from_bnode_graph_name(self):
+        lhs = dataset_with_quads((EX.s, EX.p, Literal("o"), EX.g))
+        rhs = dataset_with_quads((EX.s, EX.p, Literal("o"), BNode("g")))
+        assert not isomorphic(lhs, rhs)
+
+    def test_different_graph_name_iris(self):
+        lhs = dataset_with_quads((EX.s, EX.p, Literal("o"), EX.g1))
+        rhs = dataset_with_quads((EX.s, EX.p, Literal("o"), EX.g2))
+        assert not isomorphic(lhs, rhs)
+
+    def test_graph_name_bnode_shares_scope_with_triple_bnodes(self):
+        """A blank node used as graph name is the same node as the identical
+        blank node inside the graph's triples."""
+        lhs = dataset_with_quads((BNode("n"), EX.p, Literal("o"), BNode("n")))
+        rhs = dataset_with_quads((BNode("m"), EX.p, Literal("o"), BNode("m")))
+        assert isomorphic(lhs, rhs)
+
+        distinct = dataset_with_quads((BNode("n"), EX.p, Literal("o"), BNode("g")))
+        assert not isomorphic(lhs, distinct)
+
+    def test_bnode_graphs_not_merged(self):
+        """Two blank-node-named graphs are not the same as one graph with the
+        combined triples."""
+        split = dataset_with_quads(
+            (EX.s, EX.p, Literal("o1"), BNode("g1")),
+            (EX.s, EX.p, Literal("o2"), BNode("g2")),
+        )
+        merged = dataset_with_quads(
+            (EX.s, EX.p, Literal("o1"), BNode("g1")),
+            (EX.s, EX.p, Literal("o2"), BNode("g1")),
+        )
+        assert not isomorphic(split, merged)
+
+    def test_empty_datasets(self):
+        assert isomorphic(Dataset(), Dataset())
+
+    def test_jsonld_roundtrip(self):
+        """A Dataset serialized to JSON-LD and parsed back is isomorphic to
+        the original."""
+        dataset = dataset_with_quads(
+            (BNode("s"), EX.p, BNode("o"), BNode("g")),
+            (EX.d, EX.p, Literal("d"), DATASET_DEFAULT_GRAPH_ID),
+            (EX.s, EX.p, Literal("ng"), EX.named),
+        )
+        roundtrip = Dataset()
+        roundtrip.parse(data=dataset.serialize(format="json-ld"), format="json-ld")
+        assert isomorphic(dataset, roundtrip)

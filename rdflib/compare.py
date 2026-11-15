@@ -90,7 +90,6 @@ _:cb558f30e21ddfc05ca53108348338ade8
 from __future__ import annotations
 
 # TODO:
-# - Doesn't handle quads.
 # - Add warning and/or safety mechanism before working on large graphs?
 # - use this in existing Graph.isomorphic?
 
@@ -109,11 +108,18 @@ from datetime import datetime
 from hashlib import sha256
 from typing import (
     TYPE_CHECKING,
+    Any,
     Optional,
     Union,
 )
 
-from rdflib.graph import ConjunctiveGraph, Graph, ReadOnlyGraphAggregate, _TripleType
+from rdflib.graph import (
+    DATASET_DEFAULT_GRAPH_ID,
+    ConjunctiveGraph,
+    Dataset,
+    Graph,
+    ReadOnlyGraphAggregate,
+)
 from rdflib.term import BNode, IdentifiedNode, Node, URIRef
 
 if TYPE_CHECKING:
@@ -216,6 +222,46 @@ ColorItemTuple = tuple[ColorItem, ...]
 HashCache = Optional[dict[ColorItemTuple, str]]
 Stats = dict[str, Union[int, str]]
 
+# A quad as canonicalized here: the graph name is always an identifier, with
+# `DATASET_DEFAULT_GRAPH_ID` standing in for the default graph.
+_CanonicalQuad = tuple[Node, Node, Node, IdentifiedNode]
+# Maps (position, term) to the quads having `term` at `position`, for the
+# positions that take part in blank node coloring (subject, object, graph
+# name; the predicate position is not colored, mirroring triples).
+_QuadIndex = dict[tuple[int, Node], list[_CanonicalQuad]]
+_QUAD_NODE_POSITIONS = (0, 2, 3)
+
+
+def _quad_distinguish_items(
+    quad_index: _QuadIndex, n: Node, node: Node, w_hash: str
+) -> list[tuple[Any, ...]]:
+    """Color items witnessing the adjacency of `n` and `node` in a dataset.
+
+    Every ordered pair of distinct quad positions (subject, object, graph
+    name) at which `n` and `node` co-occur contributes one item carrying the
+    positions, the predicate, the ground term at the remaining position and
+    the color of `node`'s class. Blank nodes other than `node` are replaced
+    by a placeholder: their own colors capture them when their class is
+    refined, mirroring how triple adjacency only records the color of `node`.
+    """
+    items: list[tuple[Any, ...]] = []
+    for i, j in ((0, 2), (2, 0), (0, 3), (3, 0), (2, 3), (3, 2)):
+        k = 5 - i - j  # the remaining position of (0, 2, 3)
+        for quad in quad_index.get((i, n), ()):
+            if quad[j] == node:
+                predicate = quad[1]
+                other = quad[k]
+                items.append(
+                    (
+                        i,
+                        j,
+                        0 if isinstance(predicate, BNode) else predicate,
+                        0 if isinstance(other, BNode) else other,
+                        w_hash,
+                    )
+                )
+    return items
+
 
 class Color:
     def __init__(
@@ -261,17 +307,29 @@ class Color:
         self._hash_cache[color] = val
         return val
 
-    def distinguish(self, W: Color, graph: Graph):  # noqa: N803
+    def distinguish(
+        self,
+        W: Color,  # noqa: N803
+        graph: Graph,
+        quads: Optional[_QuadIndex] = None,
+    ):
         colors: dict[str, Color] = {}
         for n in self.nodes:
             new_color: tuple[ColorItem, ...] = list(self.color)  # type: ignore[assignment]
             for node in W.nodes:
-                new_color += [  # type: ignore[operator]
-                    (1, p, W.hash_color()) for s, p, o in graph.triples((n, None, node))
-                ]
-                new_color += [  # type: ignore[operator]
-                    (W.hash_color(), p, 3) for s, p, o in graph.triples((node, None, n))
-                ]
+                if quads is None:
+                    new_color += [  # type: ignore[operator]
+                        (1, p, W.hash_color())
+                        for s, p, o in graph.triples((n, None, node))
+                    ]
+                    new_color += [  # type: ignore[operator]
+                        (W.hash_color(), p, 3)
+                        for s, p, o in graph.triples((node, None, n))
+                    ]
+                else:
+                    new_color += _quad_distinguish_items(  # type: ignore[operator]
+                        quads, n, node, W.hash_color()
+                    )
             new_color = tuple(new_color)
             new_hash_color = self.hash_color(new_color)
 
@@ -296,6 +354,23 @@ _HashT = Callable[[], "HASH"]
 class _TripleCanonicalizer:
     def __init__(self, graph: Graph, hashfunc: _HashT = sha256):
         self.graph = graph
+        # A Dataset is canonicalized quad by quad, so that the graph name
+        # takes part in the hash: the default graph, IRI-named graphs and
+        # blank-node-named graphs are told apart, and a blank node used as a
+        # graph name shares its scope with the blank nodes of the triples.
+        # Every other graph type keeps the triple-wise behaviour.
+        self._quads: Optional[list[_CanonicalQuad]] = None
+        self._quad_index: Optional[_QuadIndex] = None
+        if isinstance(graph, Dataset):
+            self._quads = [
+                (s, p, o, DATASET_DEFAULT_GRAPH_ID if g is None else g)
+                for s, p, o, g in graph.quads()
+            ]
+            quad_index: _QuadIndex = defaultdict(list)
+            for quad in self._quads:
+                for position in _QUAD_NODE_POSITIONS:
+                    quad_index[(position, quad[position])].append(quad)
+            self._quad_index = quad_index
 
         def _hashfunc(s: str):
             h = hashfunc()
@@ -304,6 +379,12 @@ class _TripleCanonicalizer:
 
         self._hash_cache: HashCache = {}
         self.hashfunc = _hashfunc
+
+    def _statements(self) -> Iterator[tuple[Node, ...]]:
+        """The statements to canonicalize: quads for a Dataset, else triples."""
+        if self._quads is not None:
+            return iter(self._quads)
+        return iter(self.graph)
 
     def _discrete(self, coloring: list[Color]) -> bool:
         return len([c for c in coloring if not c.discrete()]) == 0
@@ -319,12 +400,13 @@ class _TripleCanonicalizer:
         bnodes: set[BNode] = set()
         others = set()
         self._neighbors = defaultdict(set)
-        for s, p, o in self.graph:
-            nodes = set([s, p, o])
+        for statement in self._statements():
+            nodes = set(statement)
             b = set([x for x in nodes if isinstance(x, BNode)])
             if len(b) > 0:
                 others |= nodes - b
                 bnodes |= b
+                s, p, o = statement[0], statement[1], statement[2]
                 if isinstance(s, BNode):
                     self._neighbors[s].add(o)
                 if isinstance(o, BNode):
@@ -332,6 +414,11 @@ class _TripleCanonicalizer:
                 if isinstance(p, BNode):
                     self._neighbors[p].add(s)
                     self._neighbors[p].add(p)
+                if len(statement) > 3:
+                    g = statement[3]
+                    if isinstance(g, BNode):
+                        self._neighbors[g].add(s)
+                        self._neighbors[g].add(o)
         if len(bnodes) > 0:
             return [Color(list(bnodes), self.hashfunc, hash_cache=self._hash_cache)] + [
                 # type error: List item 0 has incompatible type "Union[IdentifiedNode, Literal]"; expected "IdentifiedNode"
@@ -365,7 +452,7 @@ class _TripleCanonicalizer:
             for c in coloring[:]:
                 if len(c.nodes) > 1 or isinstance(c.nodes[0], BNode):
                     colors = sorted(
-                        c.distinguish(W, self.graph),
+                        c.distinguish(W, self.graph, self._quad_index),
                         key=lambda x: x.key(),
                         reverse=True,
                     )
@@ -526,13 +613,13 @@ class _TripleCanonicalizer:
             stats["canonicalize_triples_runtime"] = _total_seconds(
                 datetime.now() - start_coloring
             )
-        for triple in self.graph:
+        for triple in self._statements():
             result = tuple(self._canonicalize_bnodes(triple, bnode_labels))
             yield result
 
     def _canonicalize_bnodes(
         self,
-        triple: _TripleType,
+        triple: tuple[Node, ...],
         labels: dict[Node, str],
     ):
         for term in triple:
@@ -556,6 +643,10 @@ def isomorphic(graph1: Graph, graph2: Graph) -> bool:
     """Compare graph for equality.
 
     Uses an algorithm to compute unique hashes which takes bnodes into account.
+
+    Datasets are compared quad by quad: the default graph, IRI-named graphs
+    and blank-node-named graphs are distinguished, and a blank node used as a
+    graph name shares its scope with the blank nodes of the triples.
 
     Example:
         ```python

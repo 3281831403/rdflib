@@ -171,11 +171,14 @@ class Converter:
             has_dataset_default_id = any(
                 c.identifier == DATASET_DEFAULT_GRAPH_ID for c in all_contexts
             )
-            if (
+            is_dataset = (
                 has_dataset_default_id
                 # # type error: "Graph" has no attribute "contexts"
                 and graph.default_graph.identifier == DATASET_DEFAULT_GRAPH_ID  # type: ignore[attr-defined]
-            ):
+            )
+            if is_dataset:
+                # The default graph is only read here. Nothing may be added
+                # to it, as that would mutate the dataset being serialized.
                 default_graph = graph.default_graph  # type: ignore[attr-defined]
             else:
                 default_graph = Graph()
@@ -187,7 +190,14 @@ class Converter:
                     continue
                 if isinstance(g.identifier, URIRef):
                     graphs.append(g)
+                elif is_dataset and isinstance(g.identifier, BNode):
+                    # A blank-node-named graph of a dataset is a named graph
+                    # in its own right; serialize it as one instead of
+                    # merging it into the default graph.
+                    graphs.append(g)
                 else:
+                    # Unnamed contexts of a plain ConjunctiveGraph are merged
+                    # into the throwaway default graph, never into the input.
                     default_graph += g
         else:
             graphs = [graph]
@@ -208,6 +218,10 @@ class Converter:
                 if g.identifier != default_graph_id:
                     graphname = context.shrink_iri(g.identifier)
                     obj[context.id_key] = graphname
+            elif g.identifier != default_graph_id and isinstance(g.identifier, BNode):
+                # Blank node graph names are valid in JSON-LD.
+                graphname = g.identifier.n3()
+                obj[context.id_key] = graphname
 
             nodes = self.from_graph(g)
 
